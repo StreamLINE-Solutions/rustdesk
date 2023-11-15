@@ -3,9 +3,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_hbb/common/widgets/peers_view.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
-import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:get/get.dart';
 import 'package:bot_toast/bot_toast.dart';
@@ -23,13 +23,20 @@ bool shouldSortTags() {
   return bind.mainGetLocalOption(key: sortAbTagsOption).isNotEmpty;
 }
 
+final filterAbTagOption = 'filter-ab-by-intersection';
+bool filterAbTagByIntersection() {
+  return bind.mainGetLocalOption(key: filterAbTagOption).isNotEmpty;
+}
+
 class AbModel {
   final abLoading = false.obs;
   final pullError = "".obs;
   final pushError = "".obs;
   final tags = [].obs;
+  final RxMap<String, int> tagColors = Map<String, int>.fromEntries([]).obs;
   final peers = List<Peer>.empty(growable: true).obs;
   final sortTags = shouldSortTags().obs;
+  final filterByIntersection = filterAbTagByIntersection().obs;
   final retrying = false.obs;
   bool get emtpy => peers.isEmpty && tags.isEmpty;
 
@@ -59,11 +66,10 @@ class AbModel {
     if (!gFFI.userModel.isLogin) return;
     if (abLoading.value) return;
     if (!force && initialized) return;
-    DateTime startTime = DateTime.now();
     if (pushError.isNotEmpty) {
       try {
         // push to retry
-        pushAb(toastIfFail: false, toastIfSucc: false);
+        await pushAb(toastIfFail: false, toastIfSucc: false);
       } catch (_) {}
     }
     if (!quiet) {
@@ -81,10 +87,11 @@ class AbModel {
       if (resp.body.toLowerCase() == "null") {
         // normal reply, emtpy ab return null
         tags.clear();
+        tagColors.clear();
         peers.clear();
       } else if (resp.body.isNotEmpty) {
         Map<String, dynamic> json =
-            _jsonDecode(utf8.decode(resp.bodyBytes), resp.statusCode);
+            _jsonDecodeResp(utf8.decode(resp.bodyBytes), resp.statusCode);
         if (json.containsKey('error')) {
           throw json['error'];
         } else if (json.containsKey('data')) {
@@ -94,19 +101,7 @@ class AbModel {
           } catch (e) {}
           final data = jsonDecode(json['data']);
           if (data != null) {
-            tags.clear();
-            peers.clear();
-            if (data['tags'] is List) {
-              tags.value = data['tags'];
-            }
-            if (data['peers'] is List) {
-              for (final peer in data['peers']) {
-                peers.add(Peer.fromJson(peer));
-              }
-            }
-            if (isFull(false)) {
-              peers.removeRange(licensedDevices, peers.length);
-            }
+            _deserialize(data);
             _saveCache(); // save on success
           }
         }
@@ -115,27 +110,18 @@ class AbModel {
       if (!quiet) {
         pullError.value =
             '${translate('pull_ab_failed_tip')}: ${translate(err.toString())}';
-        if (gFFI.peerTabModel.currentTab != PeerTabIndex.ab.index) {
-          BotToast.showText(contentColor: Colors.red, text: pullError.value);
-        }
       }
     } finally {
-      var ms =
-          (Duration(milliseconds: 300) - DateTime.now().difference(startTime))
-              .inMilliseconds;
-      ms = ms > 0 ? ms : 0;
-      Future.delayed(Duration(milliseconds: ms), () {
-        abLoading.value = false;
-      });
-
+      abLoading.value = false;
       initialized = true;
       _syncAllFromRecent = true;
       _timerCounter = 0;
       if (pullError.isNotEmpty) {
         if (statusCode == 401) {
-          gFFI.userModel.reset(clearAbCache: true);
+          gFFI.userModel.reset(resetOther: true);
         }
       }
+      platformFFI.tryHandle({'name': LoadEvent.addressBook});
     }
   }
 
@@ -148,6 +134,7 @@ class AbModel {
       'alias': alias,
       'tags': tags,
     });
+    _mergePeerFromGroup(peer);
     peers.add(peer);
   }
 
@@ -163,7 +150,7 @@ class AbModel {
   void addPeer(Peer peer) {
     final index = peers.indexWhere((e) => e.id == peer.id);
     if (index >= 0) {
-      peers[index] = merge(peer, peers[index]);
+      merge(peer, peers[index]);
     } else {
       peers.add(peer);
     }
@@ -212,12 +199,24 @@ class AbModel {
     it.first.alias = alias;
   }
 
+  bool changePassword(String id, String hash) {
+    final it = peers.where((element) => element.id == id);
+    if (it.isNotEmpty) {
+      if (it.first.hash != hash) {
+        it.first.hash = hash;
+        return true;
+      }
+    }
+    return false;
+  }
+
   Future<bool> pushAb(
       {bool toastIfFail = true,
       bool toastIfSucc = true,
       bool isRetry = false}) async {
     debugPrint(
         "pushAb: toastIfFail:$toastIfFail, toastIfSucc:$toastIfSucc, isRetry:$isRetry");
+    if (!gFFI.userModel.isLogin) return false;
     pushError.value = '';
     if (isRetry) retrying.value = true;
     DateTime startTime = DateTime.now();
@@ -231,10 +230,7 @@ class AbModel {
       final api = "${await bind.mainGetApiServer()}/api/ab";
       var authHeaders = getHttpHeaders();
       authHeaders['Content-Type'] = "application/json";
-      final peersJsonData = peers.map((e) => e.toAbUploadJson()).toList();
-      final body = jsonEncode({
-        "data": jsonEncode({"tags": tags, "peers": peersJsonData})
-      });
+      final body = jsonEncode({"data": jsonEncode(_serialize())});
       http.Response resp;
       // support compression
       if (licensedDevices > 0 && body.length > 1024) {
@@ -250,7 +246,8 @@ class AbModel {
         ret = true;
         _saveCache();
       } else {
-        Map<String, dynamic> json = _jsonDecode(resp.body, resp.statusCode);
+        Map<String, dynamic> json =
+            _jsonDecodeResp(utf8.decode(resp.bodyBytes), resp.statusCode);
         if (json.containsKey('error')) {
           throw json['error'];
         } else if (resp.statusCode == 200) {
@@ -307,6 +304,7 @@ class AbModel {
   void deleteTag(String tag) {
     gFFI.abModel.selectedTags.remove(tag);
     tags.removeWhere((element) => element == tag);
+    tagColors.remove(tag);
     for (var peer in peers) {
       if (peer.tags.isEmpty) {
         continue;
@@ -342,6 +340,11 @@ class AbModel {
         }
       }).toList();
     }
+    int? oldColor = tagColors[oldTag];
+    if (oldColor != null) {
+      tagColors.remove(oldTag);
+      tagColors.addAll({newTag: oldColor});
+    }
   }
 
   void unsetSelectedTags() {
@@ -357,18 +360,28 @@ class AbModel {
     }
   }
 
-  Peer merge(Peer r, Peer p) {
-    return Peer(
-        id: p.id,
-        hash: r.hash.isEmpty ? p.hash : r.hash,
-        username: r.username.isEmpty ? p.username : r.username,
-        hostname: r.hostname.isEmpty ? p.hostname : r.hostname,
-        platform: r.platform.isEmpty ? p.platform : r.platform,
-        alias: p.alias.isEmpty ? r.alias : p.alias,
-        tags: p.tags,
-        forceAlwaysRelay: r.forceAlwaysRelay,
-        rdpPort: r.rdpPort,
-        rdpUsername: r.rdpUsername);
+  Color getTagColor(String tag) {
+    int? colorValue = tagColors[tag];
+    if (colorValue != null) {
+      return Color(colorValue);
+    }
+    return str2color2(tag, existing: tagColors.values.toList());
+  }
+
+  setTagColor(String tag, Color color) {
+    if (tags.contains(tag)) {
+      tagColors[tag] = color.value;
+    }
+  }
+
+  void merge(Peer r, Peer p) {
+    p.hash = r.hash.isEmpty ? p.hash : r.hash;
+    p.username = r.username.isEmpty ? p.username : r.username;
+    p.hostname = r.hostname.isEmpty ? p.hostname : r.hostname;
+    p.alias = p.alias.isEmpty ? r.alias : p.alias;
+    p.forceAlwaysRelay = r.forceAlwaysRelay;
+    p.rdpPort = r.rdpPort;
+    p.rdpUsername = r.rdpUsername;
   }
 
   Future<void> syncFromRecent({bool push = true}) async {
@@ -437,13 +450,13 @@ class AbModel {
             needSync = true;
           }
         } else {
-          if (!r.equal(peers[index])) {
-            uiChanged = true;
-          }
           Peer old = Peer.copy(peers[index]);
-          peers[index] = merge(r, peers[index]);
+          merge(r, peers[index]);
           if (!peerSyncEqual(peers[index], old)) {
             needSync = true;
+          }
+          if (!old.equal(peers[index])) {
+            uiChanged = true;
           }
         }
       }
@@ -460,43 +473,33 @@ class AbModel {
 
   _saveCache() {
     try {
-      final peersJsonData = peers.map((e) => e.toAbUploadJson()).toList();
-      final m = <String, dynamic>{
+      var m = _serialize();
+      m.addAll(<String, dynamic>{
         "access_token": bind.mainGetLocalOption(key: 'access_token'),
-        "peers": peersJsonData,
-        "tags": tags.map((e) => e.toString()).toList(),
-      };
+      });
       bind.mainSaveAb(json: jsonEncode(m));
     } catch (e) {
       debugPrint('ab save:$e');
     }
   }
 
-  loadCache() async {
+  Future<void> loadCache() async {
     try {
-      if (_cacheLoadOnceFlag || abLoading.value) return;
+      if (_cacheLoadOnceFlag || abLoading.value || initialized) return;
       _cacheLoadOnceFlag = true;
       final access_token = bind.mainGetLocalOption(key: 'access_token');
       if (access_token.isEmpty) return;
       final cache = await bind.mainLoadAb();
+      if (abLoading.value) return;
       final data = jsonDecode(cache);
       if (data == null || data['access_token'] != access_token) return;
-      tags.clear();
-      peers.clear();
-      if (data['tags'] is List) {
-        tags.value = data['tags'];
-      }
-      if (data['peers'] is List) {
-        for (final peer in data['peers']) {
-          peers.add(Peer.fromJson(peer));
-        }
-      }
+      _deserialize(data);
     } catch (e) {
       debugPrint("load ab cache: $e");
     }
   }
 
-  Map<String, dynamic> _jsonDecode(String body, int statusCode) {
+  Map<String, dynamic> _jsonDecodeResp(String body, int statusCode) {
     try {
       Map<String, dynamic> json = jsonDecode(body);
       return json;
@@ -506,6 +509,85 @@ class AbModel {
         throw 'HTTP $statusCode, $err';
       }
       throw err;
+    }
+  }
+
+  Map<String, dynamic> _serialize() {
+    final peersJsonData = peers.map((e) => e.toAbUploadJson()).toList();
+    final tagColorJsonData = jsonEncode(tagColors);
+    return {
+      "tags": tags,
+      "peers": peersJsonData,
+      "tag_colors": tagColorJsonData
+    };
+  }
+
+  _deserialize(dynamic data) {
+    if (data == null) return;
+    final oldOnlineIDs = peers.where((e) => e.online).map((e) => e.id).toList();
+    tags.clear();
+    tagColors.clear();
+    peers.clear();
+    if (data['tags'] is List) {
+      tags.value = data['tags'];
+    }
+    if (data['peers'] is List) {
+      for (final peer in data['peers']) {
+        peers.add(Peer.fromJson(peer));
+      }
+    }
+    if (isFull(false)) {
+      peers.removeRange(licensedDevices, peers.length);
+    }
+    // restore online
+    peers
+        .where((e) => oldOnlineIDs.contains(e.id))
+        .map((e) => e.online = true)
+        .toList();
+    if (data['tag_colors'] is String) {
+      Map<String, dynamic> map = jsonDecode(data['tag_colors']);
+      tagColors.value = Map<String, int>.from(map);
+    }
+    // add color to tag
+    final tagsWithoutColor =
+        tags.toList().where((e) => !tagColors.containsKey(e)).toList();
+    for (var t in tagsWithoutColor) {
+      tagColors[t] = str2color2(t, existing: tagColors.values.toList()).value;
+    }
+  }
+
+  reSyncToast(Future<bool> future) {
+    if (!shouldSyncAb()) return;
+    Future.delayed(Duration.zero, () async {
+      final succ = await future;
+      if (succ) {
+        await Future.delayed(Duration(seconds: 2)); // success msg
+        BotToast.showText(
+            contentColor: Colors.lightBlue,
+            text: translate('synced_peer_readded_tip'));
+      }
+    });
+  }
+
+  reset() async {
+    pullError.value = '';
+    pushError.value = '';
+    tags.clear();
+    peers.clear();
+    await bind.mainClearAb();
+  }
+
+  _mergePeerFromGroup(Peer p) {
+    final g = gFFI.groupModel.peers.firstWhereOrNull((e) => p.id == e.id);
+    if (g == null) return;
+    if (p.username.isEmpty) {
+      p.username = g.username;
+    }
+    if (p.hostname.isEmpty) {
+      p.hostname = g.hostname;
+    }
+    if (p.platform.isEmpty) {
+      p.platform = g.platform;
     }
   }
 }
